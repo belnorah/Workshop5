@@ -3,46 +3,137 @@ import express from "express";
 import { BASE_NODE_PORT } from "../config";
 import { Value } from "../types";
 
+// Définition de l'état du nœud
+type NodeState = {
+  killed: boolean;
+  x: 0 | 1 | "?" | null;
+  decided: boolean | null;
+  k: number | null;
+};
+
+type Message = {
+  from: number;
+  round: number;
+  value: Value;
+};
+
 export async function node(
-  nodeId: number, // the ID of the node
-  N: number, // total number of nodes in the network
-  F: number, // number of faulty nodes in the network
-  initialValue: Value, // initial value of the node
-  isFaulty: boolean, // true if the node is faulty, false otherwise
-  nodesAreReady: () => boolean, // used to know if all nodes are ready to receive requests
-  setNodeIsReady: (index: number) => void // this should be called when the node is started and ready to receive requests
+  nodeId: number,
+  N: number,
+  F: number,
+  initialValue: Value,
+  isFaulty: boolean,
+  nodesAreReady: () => boolean,
+  setNodeIsReady: (index: number) => void
 ) {
-  const node = express();
-  node.use(express.json());
-  node.use(bodyParser.json());
+  const app = express();
+  app.use(express.json());
+  app.use(bodyParser.json());
 
-  // TODO implement this
-  // this route allows retrieving the current status of the node
-  // node.get("/status", (req, res) => {});
+  let killed = false;
 
-  // TODO implement this
-  // this route allows the node to receive messages from other nodes
-  // node.post("/message", (req, res) => {});
+  let state: NodeState = {
+    killed: false,
+    x: isFaulty ? null : initialValue,
+    decided: isFaulty ? null : false,
+    k: isFaulty ? null : 0,
+  };
 
-  // TODO implement this
-  // this route is used to start the consensus algorithm
-  // node.get("/start", async (req, res) => {});
+  let receivedMessages: Message[] = [];
+  let interval: NodeJS.Timeout | null = null;
 
-  // TODO implement this
-  // this route is used to stop the consensus algorithm
-  // node.get("/stop", async (req, res) => {});
+  app.get("/status", (req, res) => {
+    if (isFaulty) return res.status(500).send("faulty");
+    return res.status(200).send("live");
+  });
 
-  // TODO implement this
-  // get the current state of a node
-  // node.get("/getState", (req, res) => {});
+  app.get("/getState", (req, res) => {
+    if (isFaulty) {
+      return res.json({ killed, x: null, decided: null, k: null });
+    }
+    return res.json(state);
+  });
 
-  // start the server
-  const server = node.listen(BASE_NODE_PORT + nodeId, async () => {
-    console.log(
-      `Node ${nodeId} is listening on port ${BASE_NODE_PORT + nodeId}`
-    );
+  app.post("/message", (req, res) => {
+    if (killed || isFaulty) return res.sendStatus(200);
+    const msg: Message = req.body;
+    if (msg.round === state.k) receivedMessages.push(msg);
+    return res.sendStatus(200);
+  });
 
-    // the node is ready
+  app.get("/stop", (req, res) => {
+    killed = true;
+    state.killed = true;
+    if (interval) clearInterval(interval);
+    return res.sendStatus(200);
+  });
+
+  app.get("/start", async (req, res) => {
+    if (killed || isFaulty) return res.sendStatus(200);
+
+    const runConsensus = async () => {
+      if (!nodesAreReady()) return;
+
+      if (N === 1) {
+        state.decided = true;
+        return;
+      }
+
+      for (let i = 0; i < N; i++) {
+        if (i === nodeId) continue;
+        try {
+          await fetch(`http://localhost:${BASE_NODE_PORT + i}/message`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ from: nodeId, round: state.k, value: state.x }),
+          });
+        } catch {}
+      }
+
+      setTimeout(() => {
+        const msgs = receivedMessages.filter(m => m.round === state.k);
+        receivedMessages = [];
+
+        const count: Record<string, number> = {};
+        for (const msg of msgs) {
+          if (msg.value !== null && msg.value !== "?") {
+            count[msg.value] = (count[msg.value] || 0) + 1;
+          }
+        }
+
+        if (state.x !== null) {
+          count[state.x] = (count[state.x] || 0) + 1;
+        }
+
+        const honestMajority = N - F;
+        let decidedThisRound = false;
+
+        if (count["0"] >= honestMajority) {
+          state.x = 0;
+          state.decided = true;
+          decidedThisRound = true;
+        } else if (count["1"] >= honestMajority) {
+          state.x = 1;
+          state.decided = true;
+          decidedThisRound = true;
+        } else {
+          state.x = Math.random() < 0.5 ? 0 : 1;
+        }
+
+        if (!decidedThisRound && state.k !== null && state.k > 10) {
+          state.decided = false;
+        }
+
+        if (state.k !== null) state.k++;
+      }, 200);
+    };
+
+    interval = setInterval(runConsensus, 500);
+    return res.sendStatus(200);
+  });
+
+  const server = app.listen(BASE_NODE_PORT + nodeId, () => {
+    console.log(`Node ${nodeId} is listening on port ${BASE_NODE_PORT + nodeId}`);
     setNodeIsReady(nodeId);
   });
 
